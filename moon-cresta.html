@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>Moon Cresta — Recriação HTML5</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; display:flex; flex-direction:column;
+               align-items:center; justify-content:center; font-family:monospace; }
+  canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+  #dica { color:#555; font-size:12px; margin-top:8px; letter-spacing:1px; text-align:center; }
+  #touch { display:none; gap:16px; margin-top:12px; }
+  #touch button {
+    width:70px; height:52px; font-size:16px; font-family:monospace;
+    background:#0a0a0a; color:#00d8e8; border:2px solid #00d8e8;
+    border-radius:10px; touch-action:manipulation; user-select:none; -webkit-user-select:none;
+  }
+  #touch button:active { background:#00d8e8; color:#000; }
+</style>
+</head>
+<body>
+<canvas id="game" width="224" height="256"></canvas>
+<div id="touch">
+  <button id="btnL">&#9664;</button>
+  <button id="btnF">FOGO</button>
+  <button id="btnR">&#9654;</button>
+</div>
+<div id="dica">&#8592; &#8594; MOVER | ESPAÇO ATIRAR | P PAUSA | M SOM | C CRT | ENTER INICIAR</div>
+<script>
+"use strict";
+/* ============================================================
+   MOON CRESTA — recriação baseline v2 (fan remake p/ estudo)
+   Novidades: toque no celular, inimigos animados, abertura
+   animada + scanlines CRT. Arquivo único, sem backend.
+   ============================================================ */
+
+// ---------- CONFIG ----------
+const W = 224, H = 256;
+const GROUND_Y = 232;
+const cv  = document.getElementById("game");
+const ctx = cv.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+function fitScale(){
+  const s = Math.max(1, Math.min(Math.floor(innerWidth/W), Math.floor((innerHeight-60)/H)));
+  cv.style.width = W*s+"px"; cv.style.height = H*s+"px";
+}
+addEventListener("resize", fitScale); fitScale();
+
+// ---------- ÁUDIO ----------
+let AC = null, mudo = false;
+function audio(){
+  if(!AC) AC = new (window.AudioContext||window.webkitAudioContext)();
+  if(AC.state==="suspended") AC.resume().catch(()=>{});
+  return AC;
+}
+function beep(f0, f1, dur, type="square", vol=0.08){
+  if(mudo) return;
+  try{
+    const ac=audio(), o=ac.createOscillator(), g=ac.createGain();
+    o.type=type; o.frequency.setValueAtTime(f0, ac.currentTime);
+    o.frequency.exponentialRampToValueAtTime(Math.max(30,f1), ac.currentTime+dur);
+    g.gain.setValueAtTime(vol, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime+dur);
+    o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime+dur);
+  }catch(e){}
+}
+const melodia=[659,0,784,0,988,0,784,0,659,0,523,0,587,0,659,0,
+               784,0,988,0,1175,0,988,0,784,0,659,0,587,0,523,0];
+const baixo=[131,131,165,165,196,196,165,165];
+const passoMusica=0.16;
+let musicaBus=null, musicaTimer=null, musicaTocando=false, musicaIndice=0;
+function notaMusical(freq, inicio, duracao, tipo, volume){
+  if(!freq) return;
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type=tipo; o.frequency.setValueAtTime(freq,inicio);
+  g.gain.setValueAtTime(0.0001,inicio);
+  g.gain.exponentialRampToValueAtTime(volume,inicio+0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001,inicio+duracao);
+  o.connect(g).connect(musicaBus); o.start(inicio); o.stop(inicio+duracao);
+}
+function tocarPassoMusical(){
+  if(!musicaTocando) return;
+  const agora=AC.currentTime;
+  notaMusical(melodia[musicaIndice],agora,passoMusica*0.8,"square",0.035);
+  if(musicaIndice%4===0)
+    notaMusical(baixo[(musicaIndice/4)%baixo.length],agora,passoMusica*3.7,"triangle",0.045);
+  musicaIndice=(musicaIndice+1)%melodia.length;
+  musicaTimer=setTimeout(tocarPassoMusical,passoMusica*1000);
+}
+function sincronizarMusica(){
+  const deveTocar=(estado==="jogo"||estado==="dock")&&!pausado&&!mudo;
+  if(deveTocar===musicaTocando) return;
+  if(deveTocar){
+    const ac=audio();
+    if(!musicaBus){ musicaBus=ac.createGain(); musicaBus.connect(ac.destination); }
+    musicaBus.gain.cancelScheduledValues(ac.currentTime);
+    musicaBus.gain.setTargetAtTime(0.65,ac.currentTime,0.03);
+    musicaTocando=true; tocarPassoMusical();
+  } else {
+    musicaTocando=false; clearTimeout(musicaTimer); musicaTimer=null; musicaIndice=0;
+    if(musicaBus&&AC){
+      musicaBus.gain.cancelScheduledValues(AC.currentTime);
+      musicaBus.gain.setTargetAtTime(0,AC.currentTime,0.02);
+    }
+  }
+}
+const sfx = {
+  tiro : ()=>beep(900,300,.08,"square",.05),
+  boom : ()=>beep(200,40,.35,"sawtooth",.12),
+  boomP: ()=>beep(120,30,.60,"sawtooth",.15),
+  dock : ()=>{ beep(440,440,.10); setTimeout(()=>beep(660,660,.10),110); setTimeout(()=>beep(880,880,.15),220); }
+};
+
+// ---------- SPRITES ----------
+const PAL = { Y:"#f8d800", C:"#00d8e8", M:"#f858c0", G:"#38c818",
+              R:"#f83800", W:"#e8e8e8", O:"#ff9838", ".":null };
+
+const SPR = {
+  nave1: [
+    ".....C......",
+    ".....C......",
+    "...YYYYYY...",
+    "...CCYYCC...",
+    "...YYYYYY...",
+    "..M.YYYY.M..",
+    "..MMYYYYMM..",
+    ".MMYYYYYYMM.",
+    ".M.YYYYYY.M.",
+    "....YYYY...."
+  ],
+  nave2: [
+    "............",
+    "............",
+    "..YYYYYYYY..",
+    "..YMMMMMMY..",
+    "..YYYYYYYY..",
+    "..YCCYYCCY..",
+    "..YYYYYYYY..",
+    "....YYYY...."
+  ],
+  nave3: [
+    "............",
+    "............",
+    "....YYYY....",
+    ".YYYMMMMYYY.",
+    ".YYYYYYYYYY.",
+    "MMYYYYYYYYMM",
+    "MMYCCYYCCYMM",
+    ".M.YYYYYY.M.",
+    ".M.YYYYYY.M.",
+    "...CCCCCC..."
+  ],
+  // Inimigo — frame 1 (espinhos nas diagonais externas)
+  iniA: [
+    ".M........M.",
+    "..C......C..",
+    "...CCCCCC...",
+    "..CCGGGGCC..",
+    ".CCGGGGGGCC.",
+    ".CCGGGGGGCC.",
+    "..CCGGGGCC..",
+    "...CCCCCC...",
+    "..C......C..",
+    ".M........M."
+  ],
+  // Inimigo — frame 2 (espinhos "pulsam" para fora) = animação
+  iniA2: [
+    "M..........M",
+    "M.C......C.M",
+    ".M.CCCCCC.M.",
+    "..CCGGGGCC..",
+    ".CCGGGGGGCC.",
+    ".CCGGGGGGCC.",
+    "..CCGGGGCC..",
+    ".M.CCCCCC.M.",
+    "M.C......C.M",
+    "M..........M"
+  ]
+};
+function ampliarSprite(rows, largura, altura){
+  return Array.from({length:altura},(_,y)=>{
+    const linhaOrigem=rows[Math.floor(y*rows.length/altura)];
+    return Array.from({length:largura},(_,x)=>linhaOrigem[Math.floor(x*linhaOrigem.length/largura)]).join("");
+  });
+}
+function ampliarModulo(rows, largura, aberturaCanhoes){
+  const margem=Math.floor((largura-rows[0].length)/2);
+  return rows.map((row, indice)=>{
+    const linha=Array(largura).fill(".");
+    for(let i=0;i<row.length;i++) linha[margem+i]=row[i];
+    if(indice<2){
+      linha[largura/2-aberturaCanhoes]=indice===0?"C":"Y";
+      linha[largura/2+aberturaCanhoes]=indice===0?"C":"Y";
+    }
+    return linha.join("");
+  });
+}
+SPR.nave2=ampliarModulo(ampliarSprite(SPR.nave2,15,10),24,10);
+SPR.nave3=ampliarModulo(ampliarSprite(SPR.nave3,15,12),32,14);
+// Variantes de cor (B/C/D) geradas a partir do tipo A, nos 2 frames
+function remap(rows, mapa){
+  return rows.map(r => r.split("").map(c => mapa[c] || c).join(""));
+}
+SPR.iniB  = remap(SPR.iniA,  {C:"M", G:"Y", M:"C"});
+SPR.iniB2 = remap(SPR.iniA2, {C:"M", G:"Y", M:"C"});
+SPR.iniC  = remap(SPR.iniA,  {C:"Y", G:"R", M:"G"});
+SPR.iniC2 = remap(SPR.iniA2, {C:"Y", G:"R", M:"G"});
+SPR.iniD  = remap(SPR.iniA,  {C:"G", G:"C", M:"W"});
+SPR.iniD2 = remap(SPR.iniA2, {C:"G", G:"C", M:"W"});
+
+const PONTOS = { iniA:50, iniB:80, iniC:100, iniD:150 };
+
+function drawSpr(rows, x, y){
+  for(let j=0;j<rows.length;j++)
+    for(let i=0;i<rows[j].length;i++){
+      const cor = PAL[rows[j][i]];
+      if(cor){ ctx.fillStyle=cor; ctx.fillRect(x+i, y+j, 1, 1); }
+    }
+}
+const DIGITOS = {
+  1: ["00110","01110","00110","00110","00110","00110","11111"],
+  2: ["01110","10001","00001","00010","00100","01000","11111"],
+  3: ["11110","00001","00001","01110","00001","00001","11110"]
+};
+function drawModulo(spr, x, y){
+  const rows=SPR[spr], numero=Number(spr.slice(-1)), glifo=DIGITOS[numero];
+  drawSpr(rows,x,y);
+  const startX=x+Math.floor((rows[0].length-5)/2);
+  const alturaPlaca=Math.min(rows.length,glifo.length+2);
+  const inicioPlaca=y+Math.floor((rows.length-alturaPlaca)/2);
+  const startY=inicioPlaca+Math.floor((alturaPlaca-glifo.length)/2);
+  ctx.fillStyle="#000";
+  ctx.fillRect(startX-1,inicioPlaca,7,alturaPlaca);
+  ctx.fillStyle="#fff";
+  for(let rowIndex=0;rowIndex<glifo.length;rowIndex++)
+    for(let columnIndex=0;columnIndex<glifo[rowIndex].length;columnIndex++)
+      if(glifo[rowIndex][columnIndex]==="1")
+        ctx.fillRect(startX+columnIndex,startY+rowIndex,1,1);
+}
+
+// ---------- ESTADO ----------
+let estado = "titulo";           // titulo | jogo | dock | continuar | gameover
+let score=0, vidas=3, stage=1, seg=1, pausado=false, crt=true;
+let hi = +(localStorage.getItem("mc_hi") || 5000);
+let proximaVida = 10000;
+let continuarT=0, continuarSim=false, continuarDirecao=false;
+
+const player = { x: W/2, y: GROUND_Y-12, cool:0, inv:0, mortoT:0 };
+let tiros=[], inimigos=[], tInim=[], booms=[], modulos=[];
+let wave=0, spawnQueue=[], esperaOnda=0, dockT=0;
+
+// Estrelas coloridas — agora com deriva lenta (parallax)
+const CORES_ESTRELA = ["#e8e8e8","#f83800","#38c818","#f8d800"];
+const estrelas = Array.from({length:40},()=>({
+  x: Math.random()*W|0, y: Math.random()*(GROUND_Y-40)|0,
+  c: CORES_ESTRELA[Math.random()*4|0]
+}));
+function updateStars(){
+  for(const s of estrelas){ s.y+=0.15; if(s.y>GROUND_Y-40){ s.y=0; s.x=Math.random()*W|0; } }
+}
+
+const crateras = Array.from({length:9},(_,i)=>({
+  x: 8+i*24+(i%3)*4, y: GROUND_Y+7+(i%3)*7, r: 3+(i%4)*2
+}));
+
+// ---------- ABERTURA ANIMADA (demo de inimigos cruzando) ----------
+const demo = [];
+function resetDemo(){
+  demo.length=0;
+  const tipos=["iniA","iniB","iniC","iniD"];
+  for(let i=0;i<4;i++)
+    demo.push({tipo:tipos[i], x:-20-i*60, y:118+(i%2)*22, v:0.5+i*0.15, t:i*9});
+}
+resetDemo();
+function updateTitulo(){
+  for(const d of demo){ d.x+=d.v; d.t++; if(d.x>W+12) d.x=-20; }
+}
+
+// ---------- FLUXO ----------
+function iniciarJogo(){
+  score=0; vidas=3; stage=1; seg=1; wave=0; proximaVida=10000;
+  tiros=[]; inimigos=[]; tInim=[]; booms=[]; modulos=[]; spawnQueue=[];
+  player.x=W/2; player.inv=60; player.mortoT=0; pausado=false;
+  continuarT=0; continuarSim=false;
+  estado="jogo"; novaOnda();
+}
+function finalizarJogo(){
+  estado="gameover";
+  if(score>hi){ hi=score; localStorage.setItem("mc_hi",hi); }
+}
+function confirmarContinuacao(){
+  if(continuarSim){
+    vidas=3; seg=1; player.x=W/2; player.inv=120; player.mortoT=0; player.cool=0;
+    tiros=[]; tInim=[]; booms=[]; pausado=false; continuarT=0;
+    keys[" "]=false;
+    estado="jogo";
+  } else finalizarJogo();
+}
+function novaOnda(){
+  wave++;
+  const tipos=["iniA","iniB","iniC","iniD"];
+  const tipo=tipos[(wave-1)%4];
+  const n=5+Math.min(7, stage+((wave-1)>>2));
+  const vel=0.35+stage*0.08+wave*0.03;
+  for(let i=0;i<n;i++) spawnQueue.push({tipo, t:i*40, vel});
+}
+function proximaFase(){
+  stage++; wave=0; seg=1; spawnQueue=[]; modulos=[];
+  player.y=GROUND_Y-12; player.inv=60; estado="jogo"; novaOnda();
+}
+function iniciarAcoplagem(){
+  estado="dock"; dockT=900; modulos=[]; tiros=[]; tInim=[]; inimigos=[]; spawnQueue=[];
+  modulos.push({ spr: seg===1 ? "nave2" : "nave3", x:40, y:24, vx:0.55, vy:0.8, t:0 });
+}
+function encerrarAcoplagem(){
+  modulos=[]; tiros=[]; player.y=GROUND_Y-12; player.inv=60;
+  if(wave>=8){ proximaFase(); return; }
+  estado="jogo"; novaOnda();
+}
+
+// ---------- UPDATE ----------
+function update(){
+  sincronizarMusica();
+  updateStars();
+  if(estado==="titulo"){ updateTitulo(); return; }
+  if(estado==="continuar"){
+    const direcao=keys["ArrowLeft"]||keys["ArrowRight"]||keys["a"]||keys["A"]||keys["d"]||keys["D"];
+    if(direcao&&!continuarDirecao) continuarSim=!continuarSim;
+    continuarDirecao=direcao;
+    if(keys[" "]) confirmarContinuacao();
+    if(estado==="continuar" && --continuarT<=0) finalizarJogo();
+    return;
+  }
+  continuarDirecao=false;
+  if(estado==="gameover" || pausado) return;
+
+  // --- jogador ---
+  if(player.mortoT>0){
+    player.mortoT--;
+    if(player.mortoT===0){
+      if(vidas<=0){ estado="continuar"; continuarT=600; continuarSim=false; continuarDirecao=false; }
+      else { seg=1; player.x=W/2; player.inv=120; }
+    }
+  } else {
+    const vel=1.5, largura=12;
+    if(keys["ArrowLeft"]||keys["a"]||keys["A"]) player.x-=vel;
+    if(keys["ArrowRight"]||keys["d"]||keys["D"]) player.x+=vel;
+    player.x=Math.max(largura/2, Math.min(W-largura/2, player.x));
+
+    if(player.cool>0) player.cool--;
+    if(estado!=="dock" && (keys[" "]||keys["z"]||keys["Z"]) && player.cool===0){
+      const canhoes = seg===1
+        ? [{x:0, altura:10}]
+        : seg===2
+           ? [{x:0, altura:10}, {x:-10, altura:20}, {x:10, altura:20}]
+           : [{x:0, altura:10}, {x:-10, altura:20}, {x:10, altura:20},
+             {x:-14, altura:32}, {x:14, altura:32}];
+      for(const canhao of canhoes)
+        tiros.push({x:Math.max(0,Math.min(W-1,player.x+canhao.x)), y:player.y-canhao.altura});
+      player.cool=10; sfx.tiro();
+    }
+    if(player.inv>0) player.inv--;
+  }
+
+  // --- tiros do jogador ---
+  for(const t of tiros) t.y-=4;
+  tiros=tiros.filter(t=>t.y>-4);
+
+  // --- spawn ---
+  for(const s of spawnQueue) s.t--;
+  spawnQueue=spawnQueue.filter(s=>{
+    if(s.t<=0){
+      inimigos.push({ tipo:s.tipo, x:20+Math.random()*(W-40), y:-12,
+                      vel:s.vel, t:0, pat:(wave+stage)%3, vx:(Math.random()<.5?-1:1)*(0.5+stage*0.1) });
+      return false;
+    }
+    return true;
+  });
+
+  // --- inimigos ---
+  for(const e of inimigos){
+    e.t++;
+    if(e.pat===0){ e.y+=e.vel; e.x+=Math.sin(e.t*0.04)*1.2; }
+    else if(e.pat===1){ e.y+=e.vel*1.2; e.x+=e.vx;
+      if(e.x<4||e.x>W-16) e.vx*=-1; if(e.y>170) e.y=-12; }
+    else { e.x+=e.vx; e.y+=Math.sin(e.t*0.05)*0.8;
+      if(e.x<4||e.x>W-16) e.vx*=-1; if(e.y>180) e.y=-12; }
+    e.x=Math.max(2,Math.min(W-14,e.x));
+    if(e.y>40 && Math.random()<0.003+stage*0.0008) tInim.push({x:e.x+5,y:e.y+9});
+  }
+  inimigos=inimigos.filter(e=>e.y<H);
+
+  // --- tiros inimigos ---
+  for(const t of tInim) t.y+=1.6;
+  tInim=tInim.filter(t=>t.y<H);
+
+  // --- colisões: tiro × inimigo ---
+  for(const t of tiros){
+    for(let i=inimigos.length-1;i>=0;i--){
+      const e=inimigos[i];
+      if(Math.abs(t.x-(e.x+6))<7 && Math.abs(t.y-(e.y+5))<7){
+        score+=PONTOS[e.tipo]; booms.push({x:e.x+6,y:e.y+5,t:0});
+        inimigos.splice(i,1); t.y=-10; sfx.boom();
+        if(score>=proximaVida){ vidas=Math.min(vidas+1,6); proximaVida+=10000; }
+        break;
+      }
+    }
+  }
+  tiros=tiros.filter(t=>t.y>-4);
+
+  // --- colisões: jogador ---
+  if(player.mortoT===0 && player.inv===0){
+    const px=player.x, pyTop=player.y-10*seg, pyBot=player.y;
+    const bate=(x,y,w,h)=> px+6>x && px-6<x+w && pyBot>y && pyTop<y+h;
+    let atingido=false;
+    for(const e of inimigos) if(bate(e.x,e.y,12,10)){ atingido=true; e.y=H; break; }
+    if(!atingido) for(const t of tInim) if(bate(t.x-1,t.y,3,5)){ atingido=true; t.y=H; break; }
+    if(atingido) morrer();
+  }
+
+  // --- fim de onda / acoplagem ---
+  if(estado==="jogo" && inimigos.length===0 && spawnQueue.length===0){
+    if(++esperaOnda>90){
+      esperaOnda=0;
+      if((wave===4 && seg===1) || (wave===6 && seg===2)) iniciarAcoplagem();
+      else if(wave>=8) proximaFase();
+      else novaOnda();
+    }
+  }
+
+  // --- acoplagem ---
+  if(estado==="dock"){
+    dockT--;
+    if(player.y>156) player.y=Math.max(156,player.y-1);
+    for(const m of modulos){
+      const larguraModulo=SPR[m.spr][0].length;
+      m.t++; m.x+=m.vx; m.y+=m.vy;
+      if(m.x<0||m.x>W-larguraModulo) m.vx*=-1;
+      if(m.y>H) m.y=-SPR[m.spr].length;
+      const alturaNave=SPR.nave1.length+(seg>=2?SPR.nave2.length:0)+(seg>=3?SPR.nave3.length:0);
+      const centroModulo=m.y+SPR[m.spr].length/2;
+      if(player.mortoT===0 && Math.abs(player.x-(m.x+larguraModulo/2))<10 && Math.abs(player.y-alturaNave/2-centroModulo)<10){
+        seg++; score+=500; sfx.dock(); encerrarAcoplagem(); return;
+      }
+    }
+    tiros=tiros.filter(t=>t.y>-4);
+    if(dockT<=0){ encerrarAcoplagem(); }
+  }
+
+  // --- explosões ---
+  for(const b of booms) b.t++;
+  booms=booms.filter(b=>b.t<24);
+}
+
+function morrer(){
+  booms.push({x:player.x, y:player.y-5*seg, t:0, grande:true});
+  sfx.boomP();
+  vidas--;
+  player.mortoT=90;
+}
+
+// ---------- DRAW ----------
+function texto(t,x,y,cor="#fff",alinha="left",tam=8){
+  ctx.fillStyle=cor; ctx.textAlign=alinha; ctx.font=`bold ${tam}px monospace`;
+  ctx.fillText(t,x,y);
+}
+function drawInimigo(e){
+  const frame=Math.floor(e.t/12)%2;           // alterna frames = animação
+  drawSpr(SPR[e.tipo+(frame?"2":"")], e.x|0, e.y|0);
+}
+function drawFoguete(x,y){
+  for(let i=0;i<4;i++){
+    ctx.fillStyle=["#f858c0","#f8d800","#ff9838"][i%3];
+    ctx.fillRect(x-3+Math.random()*7|0, y+1+Math.random()*3|0, 1, 2);
+  }
+}
+function draw(){
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H);
+
+  for(const s of estrelas){ ctx.fillStyle=s.c; ctx.fillRect(s.x,s.y,1,1); }
+
+  ctx.fillStyle="#202838"; ctx.fillRect(0,GROUND_Y,W,H-GROUND_Y);
+  ctx.fillStyle="#101820";
+  for(const c of crateras){ ctx.beginPath(); ctx.ellipse(c.x,c.y,c.r,c.r*0.5,0,0,7); ctx.fill(); }
+
+  if(estado==="titulo"){ drawTitulo(); drawCRT(); return; }
+
+  // HUD
+  if(Math.floor(Date.now()/400)%2===0) texto("1UP",16,12,"#f83800");
+  texto(String(score).padStart(6,"0"),40,12,"#fff");
+  texto("HI-SCORE",W/2+20,12,"#f83800","center");
+  texto(String(hi).padStart(6,"0"),W/2+20,22,"#fff","center");
+
+  // jogador
+  if(player.mortoT===0 && !(player.inv>0 && Math.floor(player.inv/4)%2)){
+    const pilha = seg===3?["nave3","nave2","nave1"]:seg===2?["nave2","nave1"]:["nave1"];
+    let yBase=player.y;
+    for(const s of pilha){ drawModulo(s, player.x-SPR[s][0].length/2, yBase-SPR[s].length); yBase-=SPR[s].length; }
+    if(estado!=="dock") drawFoguete(player.x, player.y);
+  }
+
+  for(const e of inimigos) drawInimigo(e);
+  ctx.fillStyle="#fff";
+  for(const t of tiros) ctx.fillRect(t.x,t.y,1,4);
+  ctx.fillStyle="#f83800";
+  for(const t of tInim) ctx.fillRect(t.x,t.y,2,4);
+
+  if(estado==="dock"){
+    for(const m of modulos)
+      if(Math.floor(m.t/10)%2===0) drawModulo(m.spr, m.x|0, m.y|0);
+    texto("ACOPLE O MODULO!",W/2,60,"#00d8e8","center");
+    texto(`TEMPO ${Math.ceil(dockT/60)}`,W/2,72,"#f8d800","center");
+  }
+
+  for(const b of booms){
+    const r=b.t*0.8, n=b.grande?26:14;
+    for(let i=0;i<n;i++){
+      const a=Math.random()*6.28, d=Math.random()*r;
+      ctx.fillStyle=["#fff","#f8d800","#f83800"][i%3];
+      ctx.fillRect(b.x+Math.cos(a)*d|0, b.y+Math.sin(a)*d|0, 2, 2);
+    }
+  }
+
+  for(let i=0;i<vidas;i++) drawSpr(SPR.nave1, 4+i*14, 242);
+  texto("STAGE "+stage, W-4, 252, "#00d8e8", "right");
+
+  if(pausado) texto("PAUSA",W/2,120,"#f8d800","center",14);
+  if(estado==="continuar"){
+    ctx.fillStyle="rgba(0,0,0,0.82)"; ctx.fillRect(12,82,W-24,92);
+    texto("CONTINUAR?",W/2,101,"#fff","center",12);
+    texto(continuarSim?"> SIM":"SIM",W/2-24,122,continuarSim?"#f8d800":"#777","center",10);
+    texto(!continuarSim?"> NAO":"NAO",W/2+24,122,!continuarSim?"#f8d800":"#777","center",10);
+    texto(`TEMPO ${Math.ceil(continuarT/60)}`,W/2,140,"#f858c0","center");
+    texto("ESQ/DIR ESCOLHER  ENTER CONFIRMAR",W/2,157,"#00d8e8","center",6);
+  }
+  if(estado==="gameover"){
+    texto("GAME OVER",W/2,110,"#f83800","center",16);
+    texto("PONTOS "+score,W/2,130,"#fff","center");
+    texto("ENTER P/ REINICIAR",W/2,150,"#00d8e8","center");
+  }
+  drawCRT();
+}
+
+function drawTitulo(){
+  // título com cores que giram (efeito arcade)
+  const CORES_TITULO=["#00d8e8","#f8d800","#f858c0","#38c818"];
+  const cor=CORES_TITULO[Math.floor(Date.now()/250)%4];
+  texto("MOON",W/2,70,cor,"center",24);
+  texto("CRESTA",W/2,95,cor,"center",24);
+  texto("GASTE SUAS FICHAS AQUI - O BABACA",W/2,112,"#00d8e8","center");
+
+  // inimigos demo cruzando a tela (animados)
+  for(const d of demo) drawInimigo(d);
+
+  // nave com chama animada
+  drawModulo("nave1", W/2-6, 140);
+  drawFoguete(W/2, 150);
+
+  if(Math.floor(Date.now()/500)%2===0) texto("PRESSIONE ENTER",W/2,185,"#fff","center");
+  texto("HI-SCORE "+hi,W/2,205,"#f83800","center");
+  texto("by Claudio Tamega",W/2,223,"#555","center",6);
+}
+
+// ---------- EFEITO CRT (scanlines + vinheta) ----------
+function drawCRT(){
+  if(!crt) return;
+  ctx.fillStyle="rgba(0,0,0,0.28)";
+  for(let y=0;y<H;y+=2) ctx.fillRect(0,y,W,1);
+  const v=ctx.createRadialGradient(W/2,H/2,H*0.35,W/2,H/2,H*0.75);
+  v.addColorStop(0,"rgba(0,0,0,0)");
+  v.addColorStop(1,"rgba(0,0,0,0.35)");
+  ctx.fillStyle=v; ctx.fillRect(0,0,W,H);
+}
+
+// ---------- INPUT: TECLADO ----------
+const keys={};
+addEventListener("keydown",e=>{
+  keys[e.key]=true;
+  if([" ","ArrowLeft","ArrowRight","ArrowUp","ArrowDown"].includes(e.key)) e.preventDefault();
+  audio();
+  if(estado==="continuar" && (e.key==="y"||e.key==="Y")) continuarSim=true;
+  if(estado==="continuar" && (e.key==="n"||e.key==="N")) continuarSim=false;
+  if(estado==="continuar" && (e.key==="Enter"||e.key===" ")) confirmarContinuacao();
+  else if(e.key==="Enter" && (estado==="titulo"||estado==="gameover")) iniciarJogo();
+  if((e.key==="p"||e.key==="P") && (estado==="jogo"||estado==="dock")) pausado=!pausado;
+  if(e.key==="m"||e.key==="M") mudo=!mudo;
+  if(e.key==="c"||e.key==="C") crt=!crt;
+});
+addEventListener("keyup",e=>keys[e.key]=false);
+
+// ---------- INPUT: TOQUE (celular) ----------
+const ehTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+if(ehTouch) document.getElementById("touch").style.display="flex";
+
+function bindBtn(id, tecla){
+  const b=document.getElementById(id);
+  const on =e=>{ e.preventDefault(); keys[tecla]=true;  audio(); };
+  const off=e=>{ e.preventDefault(); keys[tecla]=false; };
+  b.addEventListener("touchstart", on, {passive:false});
+  b.addEventListener("touchend",   off);
+  b.addEventListener("touchcancel",off);
+  b.addEventListener("mousedown", on); b.addEventListener("mouseup", off);
+}
+bindBtn("btnL","ArrowLeft");
+bindBtn("btnR","ArrowRight");
+bindBtn("btnF"," ");
+
+// tocar na tela também inicia/reinicia o jogo
+function toqueTela(e){
+  e.preventDefault(); audio();
+  if(estado==="continuar"){ confirmarContinuacao(); return; }
+  if(estado==="titulo"||estado==="gameover") iniciarJogo();
+}
+cv.addEventListener("touchstart", toqueTela, {passive:false});
+cv.addEventListener("mousedown",  toqueTela);
+
+// ---------- LOOP 60 FPS ----------
+let last=0, acc=0;
+function loop(ts){
+  requestAnimationFrame(loop);
+  acc+=ts-last; last=ts;
+  while(acc>16.66){ update(); acc-=16.66; }
+  draw();
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
